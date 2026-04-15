@@ -3,31 +3,18 @@ import re
 import pandas as pd
 import numpy as np
 
-from datetime import datetime
-
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import seaborn as sns
 
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import roc_auc_score
 
-from sklearn.preprocessing import LabelEncoder
 import lightgbm as lgb
 
-from IPython.display import display, Markdown
+from IPython.display import display
 from warnings import filterwarnings
 filterwarnings("ignore")
 filterwarnings("ignore", category=UserWarning, module="lightgbm")
-
-import watermark
-
 
 path_arquivos = "data/"
 
@@ -37,9 +24,12 @@ df_contrato = pd.read_parquet(f"{path_arquivos}historico_emprestimos.parquet")
 df_parcelas = pd.read_parquet(f"{path_arquivos}historico_parcelas.parquet")
 df_submissao = pd.read_parquet(f"{path_arquivos}base_submissao.parquet")
 
+# Referência temporal fixa para reprodutibilidade (evita depender do dia de execução)
+DATA_REFERENCIA = pd.Timestamp("2026-01-01")
+
 df_cadastro["id_cliente"] = df_cadastro["id_cliente"].astype("object")
 df_cadastro["data_nascimento"] = pd.to_datetime(df_cadastro["data_nascimento"], errors="coerce")
-df_cadastro["idade"] = ((pd.Timestamp.today() - df_cadastro["data_nascimento"]).dt.days // 365)
+df_cadastro["idade"] = ((DATA_REFERENCIA - df_cadastro["data_nascimento"]).dt.days // 365)
 
 # Contrato
 df_contrato["id_cliente"] = df_contrato["id_cliente"].astype("object")
@@ -74,6 +64,9 @@ data_corte = max(
     df_parcelas["data_prevista_pagamento"].max(),
     df_parcelas["data_real_pagamento"].max()
 )
+
+# Ajusta referência temporal para a data de corte dos dados
+DATA_REFERENCIA = pd.Timestamp(data_corte).normalize()
 
 print("\nData de corte:", data_corte)
 
@@ -237,16 +230,56 @@ def calcular_ks(y_true, y_prob):
 
 
 def calcular_psi(expected, actual, buckets=10):
-    breakpoints   = np.percentile(expected, np.linspace(0, 100, buckets + 1))
+    breakpoints = np.percentile(expected, np.linspace(0, 100, buckets + 1))
+    breakpoints = np.unique(breakpoints)
+
+    # Fallback quando a distribuição é muito concentrada
+    if len(breakpoints) < 3:
+        min_val = float(np.min(expected))
+        max_val = float(np.max(expected))
+        breakpoints = np.linspace(min_val, max_val + 1e-6, buckets + 1)
+
     expected_bins = np.histogram(expected, bins=breakpoints)[0] / len(expected)
     actual_bins   = np.histogram(actual,   bins=breakpoints)[0] / len(actual)
     return np.sum((actual_bins - expected_bins) * np.log((actual_bins + 1e-6) / (expected_bins + 1e-6)))
 
 
+def split_temporal(df_subset, target_col, ano_col="ano_decisao"):
+    """Cria split temporal robusto; usa holdout estratificado como fallback."""
+    if ano_col not in df_subset.columns:
+        raise ValueError(f"Coluna temporal ausente: {ano_col}")
+
+    anos = sorted(df_subset[ano_col].dropna().unique())
+
+    if len(anos) >= 3:
+        ano_test = anos[-1]
+        ano_val = anos[-2]
+        train = df_subset[df_subset[ano_col] < ano_val]
+        val = df_subset[df_subset[ano_col] == ano_val]
+        test = df_subset[df_subset[ano_col] == ano_test]
+    else:
+        train_val, test = train_test_split(
+            df_subset,
+            test_size=0.2,
+            random_state=42,
+            stratify=df_subset[target_col],
+        )
+        train, val = train_test_split(
+            train_val,
+            test_size=0.25,
+            random_state=42,
+            stratify=train_val[target_col],
+        )
+
+    for nome, base in [("train", train), ("val", val), ("test", test)]:
+        if base.empty:
+            raise ValueError(f"Split inválido: conjunto {nome} vazio.")
+
+    return train, val, test
+
+
 def treinar_modelo(df_subset, features, target=TARGET):
-    train = df_subset[df_subset["ano_decisao"] <= 2022]
-    val   = df_subset[df_subset["ano_decisao"] == 2023]
-    test  = df_subset[df_subset["ano_decisao"] >= 2024]
+    train, val, test = split_temporal(df_subset, target_col=target, ano_col="ano_decisao")
 
     X_train, y_train = train[features], train[target]
     X_val,   y_val   = val[features],   val[target]
@@ -398,7 +431,6 @@ CAT_COLS  = [
 
 df_modelo = (
     df_target
-    .drop(columns=["data_decisao"])
     .merge(df_contrato, on=["id_cliente", "id_contrato"], how="left")
     .merge(df_cadastro, on="id_cliente", how="left")
 )
@@ -427,6 +459,9 @@ if "data_decisao" in df_modelo.columns:
     df_modelo["ano_decisao"] = df_modelo["data_decisao"].dt.year
     df_modelo["mes_decisao"] = df_modelo["data_decisao"].dt.month
     features += ["ano_decisao", "mes_decisao"]
+
+if "data_decisao" in df_modelo.columns:
+    df_modelo = df_modelo.drop(columns=["data_decisao"])
 
 # Tipos
 for col in CAT_COLS:
@@ -503,7 +538,7 @@ plot_feature_importances([
 # Scoring
 # =========================
 df_sub = df_submissao.merge(df_cadastro, on="id_cliente", how="left")
-df_sub["data_decisao"] = pd.Timestamp.today().normalize()
+df_sub["data_decisao"] = DATA_REFERENCIA
 df_sub["ano_decisao"]  = df_sub["data_decisao"].dt.year
 df_sub["mes_decisao"]  = df_sub["data_decisao"].dt.month
 
